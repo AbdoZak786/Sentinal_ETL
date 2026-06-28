@@ -3,6 +3,7 @@ import pytest
 
 from app.services.repair_engine import (
     normalize_schema,
+    repair_date_format,
     repair_duplicates,
     repair_nulls,
     repair_types,
@@ -209,6 +210,100 @@ def test_repair_types_logs_failure_for_unsupported_expected_dtype() -> None:
     assert "no safe coercion available" in actions[0]["reason"]
 
 
+# --- repair_date_format ---
+
+
+def test_repair_date_format_normalizes_mixed_formats_to_iso() -> None:
+    df = pd.DataFrame(
+        {"order_date": ["2024-01-15", "15/01/2024", "2024-03-10"]}
+    )
+    date_format_report = {
+        "order_date": {
+            "non_iso8601_count": 1,
+            "examples": ["15/01/2024"],
+        }
+    }
+
+    repaired, actions = repair_date_format(
+        df,
+        date_format_report,
+        ["order_date"],
+    )
+
+    assert repaired["order_date"].tolist() == [
+        "2024-01-15",
+        "2024-01-15",
+        "2024-03-10",
+    ]
+    assert len(actions) == 1
+    assert actions[0]["action_type"] == "date_format_normalization"
+    assert actions[0]["target_column"] == "order_date"
+    assert actions[0]["rows_affected"] == 1
+    assert actions[0]["rows_unparseable"] == 0
+    assert actions[0]["before_value_sample"] == ["15/01/2024"]
+    assert actions[0]["after_value_sample"] == ["2024-01-15"]
+
+
+def test_repair_date_format_leaves_unparseable_values_null() -> None:
+    df = pd.DataFrame(
+        {"order_date": ["2024-01-15", "not_a_date", "15/01/2024"]}
+    )
+    date_format_report = {
+        "order_date": {
+            "non_iso8601_count": 2,
+            "examples": ["not_a_date", "15/01/2024"],
+        }
+    }
+
+    repaired, actions = repair_date_format(
+        df,
+        date_format_report,
+        ["order_date"],
+    )
+
+    assert repaired["order_date"].tolist()[0] == "2024-01-15"
+    assert pd.isna(repaired["order_date"].iloc[1])
+    assert repaired["order_date"].tolist()[2] == "2024-01-15"
+    assert actions[0]["rows_unparseable"] == 1
+    assert actions[0]["rows_affected"] == 2
+    assert actions[0]["before_value_sample"] == ["not_a_date", "15/01/2024"]
+    assert actions[0]["after_value_sample"] == [None, "2024-01-15"]
+
+
+def test_repair_date_format_uses_datetime_iso_when_time_present() -> None:
+    df = pd.DataFrame(
+        {"created_at": ["2024-01-15 14:30:00", "2024-02-01"]}
+    )
+    date_format_report = {
+        "created_at": {
+            "non_iso8601_count": 1,
+            "examples": ["2024-01-15 14:30:00"],
+        }
+    }
+
+    repaired, actions = repair_date_format(
+        df,
+        date_format_report,
+        ["created_at"],
+    )
+
+    assert repaired["created_at"].tolist() == [
+        "2024-01-15T14:30:00",
+        "2024-02-01T00:00:00",
+    ]
+    assert actions[0]["rows_affected"] == 2
+    assert actions[0]["rows_unparseable"] == 0
+
+
+def test_repair_date_format_noop_when_nothing_to_repair() -> None:
+    df = pd.DataFrame({"order_date": ["2024-01-15"]})
+
+    repaired, actions = repair_date_format(df, {}, ["order_date"])
+
+    assert repaired.equals(df)
+    assert actions == []
+
+
 # --- normalize_schema ---
 
 
@@ -300,6 +395,34 @@ def test_run_repair_pipeline_normalizes_schema_when_drift_detected(
     assert actions[0]["action_type"] == "schema_normalization"
     assert actions[1]["action_type"] == "type_conversion"
     assert actions[1]["target_column"] == "amount"
+
+
+def test_run_repair_pipeline_runs_date_format_repair_when_check_failed() -> None:
+    df = pd.DataFrame({"signup_date": ["2024-01-15", "15/01/2024", "2024-03-10"]})
+    validation_result = {
+        "null_check_passed": True,
+        "null_report": {"signup_date": 0},
+        "type_check_passed": True,
+        "type_report": {},
+        "duplicate_check_passed": True,
+        "duplicate_count": 0,
+        "schema_drift_detected": False,
+        "date_format_passed": False,
+        "date_format_report": {
+            "signup_date": {
+                "non_iso8601_count": 1,
+                "examples": ["15/01/2024"],
+            }
+        },
+        "detected_date_columns": ["signup_date"],
+    }
+
+    repaired, actions = run_repair_pipeline(df, validation_result)
+
+    assert repaired["signup_date"].tolist()[1] == "2024-01-15"
+    assert [action["action_type"] for action in actions] == [
+        "date_format_normalization",
+    ]
 
 
 def test_run_repair_pipeline_skips_repairs_when_all_checks_passed() -> None:

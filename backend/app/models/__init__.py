@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, Text, func, text
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +16,8 @@ class DatasetVersionStatus(str, enum.Enum):
     repairing = "repairing"
     repaired = "repaired"
     promoted = "promoted"
+    promoted_silver = "promoted_silver"
+    promoted_gold = "promoted_gold"
     failed = "failed"
 
 
@@ -38,6 +40,7 @@ class RepairActionType(str, enum.Enum):
     null_fill = "null_fill"
     column_mapping = "column_mapping"
     schema_normalization = "schema_normalization"
+    date_format_normalization = "date_format_normalization"
 
 
 class Dataset(Base):
@@ -74,11 +77,22 @@ class DatasetVersion(Base):
     )
     version_number: Mapped[int] = mapped_column(Integer)
     bronze_path: Mapped[str] = mapped_column()
+    silver_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gold_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    promoted_to_silver_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    promoted_to_gold_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     status: Mapped[DatasetVersionStatus] = mapped_column(
         Enum(
             DatasetVersionStatus,
             name="dataset_version_status",
             native_enum=False,
+            length=30,
         ),
     )
     row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -163,13 +177,7 @@ class RepairAction(Base):
         UUID(as_uuid=True),
         ForeignKey("dataset_versions.id"),
     )
-    action_type: Mapped[RepairActionType] = mapped_column(
-        Enum(
-            RepairActionType,
-            name="repair_action_type",
-            native_enum=False,
-        ),
-    )
+    action_type: Mapped[RepairActionType] = mapped_column(String(50))
     target_column: Mapped[str | None] = mapped_column(Text, nullable=True)
     before_value_sample: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
     after_value_sample: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)

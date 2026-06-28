@@ -10,6 +10,8 @@ import re
 
 import pandas as pd
 
+from app.services.validation_engine import _is_iso8601
+
 MAX_VALUE_SAMPLE = 3
 UNKNOWN_FILL_VALUE = "UNKNOWN"
 
@@ -350,6 +352,182 @@ def normalize_schema(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         )
 
 
+def _parse_single_datetime(value: object) -> pd.Timestamp:
+    if value is None or pd.isna(value):
+        return pd.NaT
+
+    text = str(value).strip()
+    if "/" in text and not _is_iso8601(text):
+        parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+        if pd.notna(parsed):
+            return parsed
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.notna(parsed):
+        return parsed
+
+    return pd.to_datetime(text, errors="coerce", dayfirst=True)
+
+
+def _parse_datetime_series(series: pd.Series) -> pd.Series:
+    return series.apply(_parse_single_datetime)
+
+
+def _value_suggests_time_component(value: object) -> bool:
+    text = str(value).strip()
+    if re.search(r"T\d{2}:\d{2}", text):
+        return True
+    return bool(re.search(r"\d{1,2}:\d{2}(:\d{2})?", text))
+
+
+def _parsed_has_non_midnight(timestamp: pd.Timestamp) -> bool:
+    return (
+        timestamp.hour != 0
+        or timestamp.minute != 0
+        or timestamp.second != 0
+        or timestamp.microsecond != 0
+    )
+
+
+def _should_use_datetime_iso_format(
+    before: pd.Series,
+    parsed: pd.Series,
+    report_entry: dict,
+) -> bool:
+    for timestamp in parsed.dropna():
+        if _parsed_has_non_midnight(timestamp):
+            return True
+
+    examples = report_entry.get("examples", [])
+    if isinstance(examples, list):
+        for example in examples:
+            if _value_suggests_time_component(example):
+                return True
+
+    for value in before.dropna():
+        if not _value_suggests_time_component(value):
+            continue
+        parsed_value = _parse_single_datetime(value)
+        if pd.notna(parsed_value) and _parsed_has_non_midnight(parsed_value):
+            return True
+
+    return False
+
+
+def _normalized_cell_value(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return str(value).strip()
+
+
+def _has_date_format_report_entry(report_entry: object) -> bool:
+    if not isinstance(report_entry, dict):
+        return False
+    count = report_entry.get("non_iso8601_count", 0)
+    return isinstance(count, int) and count > 0
+
+
+def repair_date_format(
+    df: pd.DataFrame,
+    date_format_report: dict,
+    detected_date_columns: list[str],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Normalize non-ISO8601 date strings to consistent ISO 8601 formatting."""
+    repaired = _safe_copy(df)
+    actions: list[dict] = []
+
+    if not detected_date_columns or not isinstance(date_format_report, dict):
+        return repaired, actions
+
+    columns_to_repair = [
+        column
+        for column in detected_date_columns
+        if _has_date_format_report_entry(date_format_report.get(column))
+    ]
+    if not columns_to_repair:
+        return repaired, actions
+
+    for column in columns_to_repair:
+        report_entry = date_format_report[column]
+        if column not in repaired.columns:
+            actions.append(
+                _failure_action(
+                    "date_format_normalization",
+                    target_column=column,
+                    reason="column not found in DataFrame",
+                )
+            )
+            continue
+
+        try:
+            before = repaired[column].copy()
+            parsed = _parse_datetime_series(before)
+            use_datetime_format = _should_use_datetime_iso_format(
+                before,
+                parsed,
+                report_entry,
+            )
+
+            after = pd.Series(index=before.index, dtype=object)
+            after.loc[before.isna()] = None
+
+            parsed_mask = parsed.notna()
+            if use_datetime_format:
+                after.loc[parsed_mask] = parsed.loc[parsed_mask].dt.strftime(
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+            else:
+                after.loc[parsed_mask] = parsed.loc[parsed_mask].dt.strftime("%Y-%m-%d")
+
+            unparsed_mask = before.notna() & parsed.isna()
+            after.loc[unparsed_mask] = None
+
+            rows_unparseable = int(unparsed_mask.sum())
+            rows_affected = int(
+                sum(
+                    _normalized_cell_value(before.loc[idx])
+                    != _normalized_cell_value(after.loc[idx])
+                    for idx in before.index
+                )
+            )
+
+            before_samples: list[object] = []
+            after_samples: list[object] = []
+            for idx in before.index:
+                original = before.loc[idx]
+                if pd.isna(original) or _is_iso8601(original):
+                    continue
+                before_samples.append(str(original))
+                repaired_value = after.loc[idx]
+                after_samples.append(
+                    None if pd.isna(repaired_value) else str(repaired_value)
+                )
+                if len(before_samples) >= MAX_VALUE_SAMPLE:
+                    break
+
+            repaired[column] = after
+            actions.append(
+                {
+                    "action_type": "date_format_normalization",
+                    "target_column": column,
+                    "rows_affected": rows_affected,
+                    "before_value_sample": before_samples,
+                    "after_value_sample": after_samples,
+                    "rows_unparseable": rows_unparseable,
+                }
+            )
+        except Exception as exc:
+            actions.append(
+                _failure_action(
+                    "date_format_normalization",
+                    target_column=column,
+                    reason=str(exc),
+                )
+            )
+
+    return repaired, actions
+
+
 def _remap_report_keys(report: dict, renames: dict) -> dict:
     if not renames:
         return report
@@ -375,6 +553,12 @@ def run_repair_pipeline(
             all_actions.append(schema_action)
             renames = schema_action.get("renames", {})
             if isinstance(renames, dict) and renames:
+                detected_date_columns = pipeline_state.get("detected_date_columns", [])
+                remapped_date_columns = [
+                    renames.get(column, column)
+                    for column in detected_date_columns
+                    if isinstance(column, str)
+                ]
                 pipeline_state = {
                     **pipeline_state,
                     "null_report": _remap_report_keys(
@@ -385,6 +569,11 @@ def run_repair_pipeline(
                         pipeline_state.get("type_report", {}),
                         renames,
                     ),
+                    "date_format_report": _remap_report_keys(
+                        pipeline_state.get("date_format_report", {}),
+                        renames,
+                    ),
+                    "detected_date_columns": remapped_date_columns,
                 }
 
         if not pipeline_state.get("type_check_passed", True):
@@ -392,6 +581,23 @@ def run_repair_pipeline(
             if isinstance(type_report, dict) and type_report:
                 repaired, type_actions = repair_types(repaired, type_report)
                 all_actions.extend(type_actions)
+
+        if not pipeline_state.get("date_format_passed", True):
+            date_format_report = pipeline_state.get("date_format_report", {})
+            detected_date_columns = pipeline_state.get("detected_date_columns", [])
+            if isinstance(date_format_report, dict) and date_format_report:
+                if not detected_date_columns:
+                    detected_date_columns = [
+                        column
+                        for column in date_format_report
+                        if _has_date_format_report_entry(date_format_report[column])
+                    ]
+                repaired, date_actions = repair_date_format(
+                    repaired,
+                    date_format_report,
+                    detected_date_columns,
+                )
+                all_actions.extend(date_actions)
 
         if not pipeline_state.get("null_check_passed", True):
             null_report = pipeline_state.get("null_report", {})

@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import pyarrow.parquet as pq
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +24,7 @@ from app.services.validation_engine import (
     check_nulls,
     check_types,
     compute_quality_score,
+    dataframe_column_schema,
     detect_schema_drift,
 )
 
@@ -47,16 +47,12 @@ def _read_parquet_dataframe(bronze_path: str) -> pd.DataFrame:
 
 
 def _read_parquet_column_schema(bronze_path: str) -> dict[str, str]:
-    parquet_file = _parquet_path(bronze_path)
-    if not parquet_file.exists():
-        raise FileNotFoundError(f"Parquet file not found: {bronze_path}")
-
-    schema = pq.ParquetFile(parquet_file).schema_arrow
-    return {field.name: str(field.type) for field in schema}
+    """Load column dtypes via pandas, matching in-memory DataFrame schema capture."""
+    return dataframe_column_schema(_read_parquet_dataframe(bronze_path))
 
 
 def _current_column_schema(df: pd.DataFrame) -> dict[str, str]:
-    return {col: str(dtype) for col, dtype in df.dtypes.items()}
+    return dataframe_column_schema(df)
 
 
 def _all_checks_passed(

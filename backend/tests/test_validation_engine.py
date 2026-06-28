@@ -8,6 +8,7 @@ from app.services.validation_engine import (
     check_types,
     compute_quality_score,
     detect_schema_drift,
+    normalize_dtype_name,
 )
 
 
@@ -107,6 +108,34 @@ def test_check_types_fails_on_missing_column(types_pass_df: pd.DataFrame) -> Non
     assert result["report"]["missing_col"] == {"expected": "int64", "actual": None}
 
 
+def test_check_types_treats_pyarrow_and_pandas_string_dtypes_as_equivalent() -> None:
+    df = pd.DataFrame({"label": ["a", "b"]})
+
+    result = check_types(df, {"label": "large_string"})
+
+    assert result["passed"] is True
+    assert result["report"] == {}
+
+
+def test_check_types_treats_pyarrow_and_pandas_float_dtypes_as_equivalent() -> None:
+    df = pd.DataFrame({"amount": [1.0, 2.5]})
+
+    result = check_types(df, {"amount": "double"})
+
+    assert result["passed"] is True
+    assert result["report"] == {}
+
+
+def test_normalize_dtype_name_maps_equivalent_names() -> None:
+    assert normalize_dtype_name("large_string") == "string"
+    assert normalize_dtype_name("str") == "string"
+    assert normalize_dtype_name("double") == "float"
+    assert normalize_dtype_name("float64") == "float"
+    assert normalize_dtype_name("int64") == "int"
+    assert normalize_dtype_name("boolean") == "bool"
+    assert normalize_dtype_name("datetime64[ns]") == "datetime64[ns]"
+
+
 # --- check_duplicates ---
 
 
@@ -144,6 +173,16 @@ def test_detect_schema_drift_passes_when_schemas_match() -> None:
     assert result["drift_detected"] is False
     assert result["report"]["added_columns"] == []
     assert result["report"]["removed_columns"] == []
+    assert result["report"]["type_changes"] == {}
+
+
+def test_detect_schema_drift_ignores_pyarrow_vs_pandas_dtype_naming() -> None:
+    previous = {"name": "large_string", "amount": "double"}
+    current = {"name": "str", "amount": "float64"}
+
+    result = detect_schema_drift(current, previous)
+
+    assert result["drift_detected"] is False
     assert result["report"]["type_changes"] == {}
 
 

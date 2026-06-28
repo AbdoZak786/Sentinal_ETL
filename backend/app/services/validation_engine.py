@@ -26,6 +26,30 @@ ISO8601_DATETIME_PATTERN = re.compile(
 DATE_COLUMN_PARSE_THRESHOLD = 0.8
 MAX_NON_ISO8601_EXAMPLES = 5
 
+_STRING_DTYPES = frozenset({"large_string", "string", "str", "object"})
+_FLOAT_DTYPES = frozenset({"double", "float64", "float32", "float"})
+_INT_DTYPES = frozenset({"int64", "int32", "int"})
+_BOOL_DTYPES = frozenset({"bool", "boolean"})
+
+
+def normalize_dtype_name(dtype_str: str) -> str:
+    """Map equivalent PyArrow/pandas dtype names to one canonical form."""
+    normalized = dtype_str.strip().lower()
+    if normalized in _STRING_DTYPES:
+        return "string"
+    if normalized in _FLOAT_DTYPES:
+        return "float"
+    if normalized in _INT_DTYPES:
+        return "int"
+    if normalized in _BOOL_DTYPES:
+        return "bool"
+    return normalized
+
+
+def dataframe_column_schema(df: pd.DataFrame) -> dict[str, str]:
+    """Return column dtypes using pandas ``df.dtypes`` string forms."""
+    return {col: str(dtype) for col, dtype in df.dtypes.items()}
+
 
 def check_nulls(df: pd.DataFrame, threshold: float = 0.0) -> NullCheckResult:
     """Return null counts per column and whether all columns meet the threshold."""
@@ -62,7 +86,7 @@ def check_types(
             continue
 
         actual = str(df[col].dtype)
-        if actual != expected:
+        if normalize_dtype_name(actual) != normalize_dtype_name(expected):
             report[col] = {"expected": expected, "actual": actual}
 
     return {"passed": len(report) == 0, "report": report}
@@ -93,10 +117,12 @@ def detect_schema_drift(
 
     type_changes: dict[str, dict[str, str]] = {}
     for col in sorted(current_names & previous_names):
-        if current_columns[col] != previous_columns[col]:
+        current_dtype = current_columns[col]
+        previous_dtype = previous_columns[col]
+        if normalize_dtype_name(current_dtype) != normalize_dtype_name(previous_dtype):
             type_changes[col] = {
-                "previous": previous_columns[col],
-                "current": current_columns[col],
+                "previous": previous_dtype,
+                "current": current_dtype,
             }
 
     drift_detected = bool(added_columns or removed_columns or type_changes)
